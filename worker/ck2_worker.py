@@ -33,6 +33,7 @@ import subprocess
 import sys
 import time
 import traceback
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")   # before any cv2 import
@@ -257,6 +258,44 @@ def cuda_plan(job: dict, width: int, height: int, count: int, torch) -> dict:
     }
 
 
+@contextmanager
+def windows_inference(runtime, temp_dir: Path):
+    """Bridge CUDA autocast and Windows mmap cleanup for the pinned model."""
+    import torch
+    from corridorkey import blocks
+
+    attend = blocks._sdpa_with_region_groups
+    remove = runtime.safe_remove
+
+    def attention(q, k, v, num_windows, full_idx, groups):
+        # The original allocates its indexed destination with q.dtype, but CUDA
+        # autocast can produce bf16 from float queries. Run the indexed operation
+        # in that same autocast dtype, then keep the caller's output dtype.
+        if num_windows > 0 and q.dtype == torch.float32 and torch.is_autocast_enabled("cuda"):
+            dtype = torch.get_autocast_dtype("cuda")
+            with torch.autocast("cuda", enabled=False):
+                out = attend(q.to(dtype), k.to(dtype), v.to(dtype), num_windows, full_idx, groups)
+            return out.to(q.dtype)
+        return attend(q, k, v, num_windows, full_idx, groups)
+
+    def remove_temp(path):
+        try:
+            remove(path)
+        except PermissionError as exc:
+            # On Windows an active mmap prevents unlink. The host clears the
+            # staging directory after this worker exits and releases its maps.
+            if exc.winerror != 32 or path is None or Path(path).parent != temp_dir:
+                raise
+
+    blocks._sdpa_with_region_groups = attention
+    runtime.safe_remove = remove_temp
+    try:
+        yield
+    finally:
+        runtime.safe_remove = remove
+        blocks._sdpa_with_region_groups = attend
+
+
 # --- the run (talks to CorridorKey) ----------------------------------------
 
 def run(job: dict, plan: dict, frames: list[str]) -> None:
@@ -348,8 +387,10 @@ def run(job: dict, plan: dict, frames: list[str]) -> None:
         output_format="exr", exr_dtype="half")
     writer_cfg = vio.WriterConfig()
     try:
-        rt.run_inference(model, job["frames_dir"], str(work / "out"), cfg, writer_cfg,
-                         initial_hint_path=first_hint, hint_video_path=every_hint)
+        compatibility = windows_inference(rt, cfg.temp_dir) if plan["device"] == "cuda" else nullcontext()
+        with compatibility:
+            rt.run_inference(model, job["frames_dir"], str(work / "out"), cfg, writer_cfg,
+                             initial_hint_path=first_hint, hint_video_path=every_hint)
     finally:
         pool.shutdown(wait=True)
     del model
