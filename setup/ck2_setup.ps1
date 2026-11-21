@@ -35,6 +35,24 @@ function Confirm-Hashes([string]$directory, [string]$manifest) {
     }
 }
 
+$requiredSpace = @{}
+function Add-SpaceRequirement([string]$directory, [long]$bytes) {
+    $drive = [IO.Path]::GetPathRoot($directory)
+    if ($drive -match '^[a-zA-Z]:\\$') { $requiredSpace[$drive] = [long]$requiredSpace[$drive] + $bytes }
+}
+if (!(Test-Path -LiteralPath (Join-Path $RuntimeFolder '.venv\Lib\site-packages\torch\lib\torch_cuda.dll'))) {
+    Add-SpaceRequirement $RuntimeFolder 5GB
+}
+if (!$RuntimeOnly -and !(Test-Path -LiteralPath (Join-Path $code 'weights\corridorkey_v2.safetensors'))) {
+    Add-SpaceRequirement $Folder 5GB
+}
+foreach ($drive in $requiredSpace.Keys) {
+    $free = [IO.DriveInfo]::new($drive).AvailableFreeSpace
+    if ($free -lt $requiredSpace[$drive]) {
+        throw "Insufficient space on $drive for CorridorKey setup. Use -Folder and -RuntimeFolder to choose volumes with more space."
+    }
+}
+
 if (!$RuntimeOnly -and !(Test-Path -LiteralPath $licence -PathType Leaf)) {
     Write-Host 'CorridorKey 2.0 by Corridor Digital uses the Corridor Key Licence (CC BY-NC-SA 4.0 with additional terms).'
     Write-Host 'Read it at https://github.com/nikopueringer/CorridorKey2.0/blob/main/LICENSE'
