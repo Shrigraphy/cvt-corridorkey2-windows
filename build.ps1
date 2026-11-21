@@ -26,13 +26,13 @@ function Get-Source([string]$name, [string]$url, [string]$sha256) {
 }
 
 New-Item -ItemType Directory -Path $deps -Force | Out-Null
-$stamp = Join-Path $prefix 'windows-static-3.5.2-3.2.3-trimpaths'
+$stamp = Join-Path $prefix 'windows-static-3.5.2-3.2.3-msvc'
 if (!(Test-Path -LiteralPath $stamp)) {
     Get-Source 'imath' 'https://github.com/AcademySoftwareFoundation/Imath/archive/refs/tags/v3.2.3.tar.gz' 'e10c12b3f21f45bf08e09d4215d9c7691368d747beebd840de0b6fefed2df9f8'
     Get-Source 'openexr' 'https://github.com/AcademySoftwareFoundation/openexr/archive/refs/tags/v3.5.2.tar.gz' '85a291b9b8563fabef1aa3f6e912d744ce1d4b9fd5a8f978eda194cd51b15ae9'
     # OpenJPH's diagnostic macros embed __FILE__. Trim the builder's source root.
     $trim = '/d1trimfile:"' + $root + '"'
-    $common = @('-A', 'x64', "-DCMAKE_INSTALL_PREFIX=$prefix", "-DCMAKE_CXX_FLAGS=$trim",
+    $common = @('-A', 'x64', "-DCMAKE_INSTALL_PREFIX=$prefix", "-DCMAKE_CXX_FLAGS=/DWIN32 /D_WINDOWS /EHsc $trim",
                 '-DBUILD_SHARED_LIBS=OFF', '-DBUILD_TESTING=OFF')
     Invoke-Native 'cmake' (@('-S', "$deps/imath", '-B', "$deps/build-imath") + $common +
         @('-DIMATH_INSTALL_PKG_CONFIG=OFF', '-DPYTHON=OFF'))
