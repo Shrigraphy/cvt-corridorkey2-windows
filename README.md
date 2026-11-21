@@ -23,6 +23,8 @@ From [Creative Video Tips](https://creativevideotips.com), created by Chadwick. 
 
 Use Windows x64 with an NVIDIA RTX GPU and a driver compatible with CUDA 13.2. The plugin uses the Microsoft Visual C++ 2015–2022 x64 runtime. Allow about 15 GB of free space for setup.
 
+Verified in Resolve Studio 21.1.2 on an RTX 3080 with 10 GB of VRAM. The real model processed 12-frame synthetic green-screen clips at 640×384 and 1920×1080. Both runs produced 12 RGBA EXRs with transparent backgrounds. The 1080p run took 208 seconds, including model loading from an external hard drive.
+
 The installer copies the plugin to `%LOCALAPPDATA%\OFX\Plugins` and adds that folder to your user `OFX_PLUGIN_PATH`. Setup defaults to `%USERPROFILE%\CorridorKey`. To put the models and runtime on different drives, run `ck2_setup.ps1` from the bundle's `Contents\Resources\setup` folder and pass `-Folder` and `-RuntimeFolder`. Use an NTFS volume for the runtime. Settings are saved in `%USERPROFILE%\.config\cvt-corridorkey2\settings.json`.
 
 Windows builds require Visual Studio 2022 with Desktop development with C++ and CMake. Run `powershell -ExecutionPolicy Bypass -File .\build.ps1` to build the pinned static OpenEXR and Imath libraries, build the OFX bundle, and run the C++ tests.
