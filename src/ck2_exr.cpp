@@ -18,7 +18,12 @@
 #include <cstddef>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <mutex>
+#ifdef _WIN32
+#include <fstream>
+#include <ImfStdIO.h>
+#endif
 
 #include "ck2_core.h"
 
@@ -62,19 +67,33 @@ bool writeExr(const std::string& path, const float* rgba, int width, int height,
             header.channels().insert(names[c], Imf::Channel(Imf::HALF));
             fb.insert(names[c], Imf::Slice(Imf::HALF, reinterpret_cast<char*>(px.data() + c), xs, ys));
         }
+#ifdef _WIN32
+        {
+            std::ofstream target(std::filesystem::u8path(tmp), std::ios::binary);
+            if (!target) throw std::runtime_error("could not open " + tmp);
+            Imf::StdOFStream stream(target, tmp.c_str());
+            Imf::OutputFile file(stream, header);
+            file.setFrameBuffer(fb);
+            file.writePixels(height);
+        }
+#else
         {
             Imf::OutputFile file(tmp.c_str(), header);
             file.setFrameBuffer(fb);
             file.writePixels(height);
         }
-        if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-            std::remove(tmp.c_str());
+#endif
+        std::error_code ec;
+        std::filesystem::rename(std::filesystem::u8path(tmp), std::filesystem::u8path(path), ec);
+        if (ec) {
+            std::filesystem::remove(std::filesystem::u8path(tmp), ec);
             error = "could not rename " + tmp;
             return false;
         }
         return true;
     } catch (const std::exception& e) {
-        std::remove(tmp.c_str());
+        std::error_code ignored;
+        std::filesystem::remove(std::filesystem::u8path(tmp), ignored);
         error = std::string("EXR write failed: ") + e.what();
         return false;
     }
@@ -83,7 +102,14 @@ bool writeExr(const std::string& path, const float* rgba, int width, int height,
 bool readExrRGBA(const std::string& path, ImageRGBA& out, std::string& error) {
     try {
         useThreads();
+#ifdef _WIN32
+        std::ifstream source(std::filesystem::u8path(path), std::ios::binary);
+        if (!source) throw std::runtime_error("could not open " + path);
+        Imf::StdIFStream stream(source, path.c_str());
+        Imf::InputFile file(stream);
+#else
         Imf::InputFile file(path.c_str());
+#endif
         const Imath::Box2i dw = file.header().dataWindow();
         const int w = dw.max.x - dw.min.x + 1, h = dw.max.y - dw.min.y + 1;
         if (w <= 0 || h <= 0) { error = "empty EXR"; return false; }

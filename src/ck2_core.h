@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdio>
+#ifdef _WIN32
+#include <filesystem>
+#endif
 #include <locale>
 #include <sstream>
 #include <string>
@@ -573,7 +576,12 @@ inline double thumbDiff(const std::vector<float>& a, const std::vector<float>& b
 constexpr double kThumbChanged = 0.03;
 
 inline bool writeThumb(const std::string& path, const std::vector<float>& t) {
+#ifdef _WIN32
+    FILE* f = nullptr;
+    _wfopen_s(&f, std::filesystem::u8path(path).c_str(), L"wb");
+#else
     FILE* f = std::fopen(path.c_str(), "wb");
+#endif
     if (!f) return false;
     bool ok = std::fwrite("CK2T", 1, 4, f) == 4 &&
               std::fwrite(t.data(), sizeof(float), t.size(), f) == t.size();
@@ -581,7 +589,12 @@ inline bool writeThumb(const std::string& path, const std::vector<float>& t) {
 }
 
 inline bool readThumb(const std::string& path, std::vector<float>& t) {
+#ifdef _WIN32
+    FILE* f = nullptr;
+    _wfopen_s(&f, std::filesystem::u8path(path).c_str(), L"rb");
+#else
     FILE* f = std::fopen(path.c_str(), "rb");
+#endif
     if (!f) return false;
     char magic[4];
     t.assign(kThumbW * kThumbH * 3, 0.0f);

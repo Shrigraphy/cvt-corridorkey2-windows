@@ -19,20 +19,25 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
-#include <dlfcn.h>
 #include <filesystem>
-#include <spawn.h>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <set>
 #include <sstream>
+#ifdef _WIN32
+#include <windows.h>
+#include <shellapi.h>
+#else
+#include <dlfcn.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 extern char** environ;
+#endif
 
 namespace fs = std::filesystem;
 
@@ -40,7 +45,11 @@ namespace {
 
 const char* kPluginID = "com.creativevideotips.corridorkey2";
 const char* kDefaultModel = "~/CorridorKey/CorridorKey2.0";
+#ifdef _WIN32
+const char* kDefaultPython = "~/CorridorKey/.venv/Scripts/python.exe";
+#else
 const char* kDefaultPython = "~/CorridorKey/.venv/bin/python";
+#endif
 
 const char* kProcess = "process";
 const char* kStatus = "status";
@@ -71,21 +80,29 @@ const char* kInstallModel = "installModel";
 const int kWindowChoices[] = {0, 8, 16, 24, 40, 80};          // 0 = Auto
 const char* kPrecisionChoices[] = {"auto", "bf16", "fp16"};
 
+std::string homePath() {
+#ifdef _WIN32
+    wchar_t path[32768];
+    const auto length = GetEnvironmentVariableW(L"USERPROFILE", path, 32768);
+    return length && length < 32768 ? fs::path(path).generic_u8string() : "";
+#else
+    const char* home = std::getenv("HOME");
+    return home ? home : "";
+#endif
+}
+
 std::string expandHome(const std::string& p) {
-    if (!p.empty() && p[0] == '~') {
-        const char* home = std::getenv("HOME");
-        return std::string(home ? home : "") + p.substr(1);
-    }
+    if (!p.empty() && p[0] == '~') return homePath() + p.substr(1);
     return p;
 }
 
 // Logs always stay on this Mac; results and staging go in the Cache Folder.
-fs::path localRoot() { return fs::path(expandHome("~/.cache/cvt-corridorkey2")); }
+fs::path localRoot() { return fs::u8path(expandHome("~/.cache/cvt-corridorkey2")); }
 
 // The Cache Folder for new nodes: ~/.config/cvt-corridorkey2/settings.json
 // {"cache_folder": "..."} lets each Mac choose (e.g. a fast media drive).
 std::string settingsValue(const char* key, const char* fallback) {
-    std::ifstream in(expandHome("~/.config/cvt-corridorkey2/settings.json"));
+    std::ifstream in(fs::u8path(expandHome("~/.config/cvt-corridorkey2/settings.json")));
     std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     std::string value = ck2::jsonField(text, key);
     return value.empty() ? fallback : value;
@@ -101,10 +118,30 @@ std::string modelFolderPath() { return expandHome(settingsValue("model_folder", 
 std::string pythonPath() { return expandHome(settingsValue("python", kDefaultPython)); }
 
 fs::path bundleResources() {
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(&bundleResources), &module)) {
+        wchar_t path[32768];
+        const auto length = GetModuleFileNameW(module, path, 32768);
+        if (length && length < 32768) return fs::path(path).parent_path().parent_path() / "Resources";
+    }
+#else
     Dl_info info;
     if (dladdr(reinterpret_cast<void*>(&bundleResources), &info) && info.dli_fname)
         return fs::path(info.dli_fname).parent_path().parent_path() / "Resources";
+#endif
     return {};
+}
+
+void setMode(const fs::path& path, int mode) {
+#ifdef _WIN32
+    // Windows files inherit access control from their folders.
+    (void)path;
+    (void)mode;
+#else
+    chmod(path.c_str(), static_cast<mode_t>(mode));
+#endif
 }
 
 // One line in ~/.cache/cvt-corridorkey2/logs/plugin.log, for troubleshooting.
@@ -112,11 +149,17 @@ void plog(const std::string& line) {
     const fs::path dir = localRoot() / "logs";
     std::error_code ec;
     fs::create_directories(dir, ec);
-    chmod(dir.parent_path().c_str(), 0700);
-    chmod(dir.c_str(), 0700);
+    setMode(dir.parent_path(), 0700);
+    setMode(dir, 0700);
     std::time_t now = std::time(nullptr);
     char ts[32];
-    std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    std::tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &now);
+#else
+    localtime_r(&now, &local);
+#endif
+    std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &local);
     std::ofstream(dir / "plugin.log", std::ios::app) << ts << "  " << ck2::kVersion << "  " << line << "\n";
 }
 
@@ -133,15 +176,22 @@ std::string newNodeId() {
 // else (a media drive, a shared network folder) it is readable by others, so
 // other Macs and users on the same project can use the results.
 bool keepPrivate(const fs::path& root) {
-    const char* home = std::getenv("HOME");
-    if (!home || !*home) return true;
-    const std::string h = fs::path(home).lexically_normal().string() + "/";
-    const std::string r = root.lexically_normal().string() + "/";
+    const auto home = homePath();
+    if (home.empty()) return true;
+#ifdef _WIN32
+    const auto h = fs::u8path(home).lexically_normal().generic_wstring() + L"/";
+    const auto r = root.lexically_normal().generic_wstring() + L"/";
+    return r.size() >= h.size() && CompareStringOrdinal(r.c_str(), static_cast<int>(h.size()),
+        h.c_str(), static_cast<int>(h.size()), TRUE) == CSTR_EQUAL;
+#else
+    const auto h = fs::u8path(home).lexically_normal().generic_u8string() + "/";
+    const auto r = root.lexically_normal().generic_u8string() + "/";
     return r.compare(0, h.size(), h) == 0;
+#endif
 }
 
 void setFileMode(const fs::path& file, const fs::path& root) {
-    chmod(file.c_str(), keepPrivate(root) ? 0600 : 0644);
+    setMode(file, keepPrivate(root) ? 0600 : 0644);
 }
 
 // A node ID is exactly 16 lowercase hex digits. It comes from the comp, so
@@ -157,22 +207,22 @@ bool isNodeId(const std::string& id) {
 // already existed, the Cache Folder itself included, are never changed: a
 // comp's Cache Folder could point at any folder. Returns false on failure.
 bool makePrivateDirs(const fs::path& root, const fs::path& sub) {
-    const mode_t mode = keepPrivate(root) ? 0700 : 0755;
+    const int mode = keepPrivate(root) ? 0700 : 0755;
     std::error_code ec;
     if (!fs::exists(root, ec)) {
         fs::create_directories(root, ec);
         if (ec) return false;
-        chmod(root.c_str(), mode);
+        setMode(root, mode);
     }
     if (!fs::is_directory(root, ec)) return false;
     fs::path q = root;
     for (const auto& part : sub.lexically_normal()) {
-        const std::string name = part.string();
+        const std::string name = part.generic_u8string();
         if (name.empty() || name == "." || name == ".." || name == "/") return false;
         q /= part;
         if (!fs::exists(q, ec)) {
             if (!fs::create_directory(q, ec)) return false;
-            chmod(q.c_str(), mode);
+            setMode(q, mode);
         }
     }
     return fs::is_directory(q, ec);
@@ -195,7 +245,7 @@ void pruneCache(const fs::path& mattes, const fs::path& keep, double limitGB) {
     std::error_code ec;
     for (auto& e : fs::directory_iterator(mattes, ec)) {
         // Only the plugin's own node folders, never anything else in the folder.
-        if (!e.is_directory(ec) || !isNodeId(e.path().filename().string())) continue;
+        if (!e.is_directory(ec) || !isNodeId(e.path().filename().generic_u8string())) continue;
         Dir d{e.path(), fs::last_write_time(e.path(), ec), folderBytes(e.path())};
         total += d.bytes;
         dirs.push_back(d);
@@ -324,13 +374,13 @@ private:
         }
     }
     bool modelInstalled() {
-        return fs::exists(pythonPath()) &&
-               fs::exists(fs::path(modelFolderPath()) / "weights" / "corridorkey_v2.safetensors");
+        return fs::exists(fs::u8path(pythonPath())) &&
+               fs::exists(fs::u8path(modelFolderPath()) / "weights" / "corridorkey_v2.safetensors");
     }
     fs::path cacheFolder() {
         std::string f;
         cacheFolder_->getValue(f);
-        return fs::path(expandHome(f.empty() ? defaultCacheFolder() : f)).lexically_normal();
+        return fs::u8path(expandHome(f.empty() ? defaultCacheFolder() : f)).lexically_normal();
     }
     fs::path nodeCacheDir() {
         std::string id;
@@ -403,12 +453,12 @@ void CorridorKey2Effect::startProcess() {
     const std::string python = pythonPath();       // this Mac's, never the comp's
     const std::string model = modelFolderPath();
     fs::path worker = bundleResources() / "worker" / "ck2_worker.py";
-    if (!fs::exists(fs::path(model) / "corridorkey") || !fs::exists(python)) {
+    if (!fs::exists(fs::u8path(model) / "corridorkey") || !fs::exists(fs::u8path(python))) {
         installModel_->setIsSecret(false);
         setStatus("Error: CorridorKey isn't installed. Use Setup > Install Model");
         return;
     }
-    if (!fs::exists(fs::path(model) / "weights" / "corridorkey_v2.safetensors")) {
+    if (!fs::exists(fs::u8path(model) / "weights" / "corridorkey_v2.safetensors")) {
         installModel_->setIsSecret(false);
         setStatus("Error: the weights are missing. Use Setup > Install Model");
         return;
@@ -437,7 +487,7 @@ void CorridorKey2Effect::startProcess() {
 
     const fs::path root = cacheFolder();
     if (!makePrivateDirs(root, "")) {
-        setStatus("Error: the Cache Folder isn't available: " + root.string());
+        setStatus("Error: the Cache Folder isn't available: " + root.generic_u8string());
         return;
     }
     fs::path staging = root / "staging" / id;
@@ -516,17 +566,17 @@ void CorridorKey2Effect::startProcess() {
                         ck2::toModelSpace(cv, dp[0], dp[1], dp[2]);
                     }
             });
-            ok = ck2::writeExr((staging / "frames" / name).string(), conv.data(), w, h, w * 4L, err);
+            ok = ck2::writeExr((staging / "frames" / name).generic_u8string(), conv.data(), w, h, w * 4L, err);
             setFileMode(staging / "frames" / name, root);
         } else {
-            ok = ck2::writeExr((staging / "frames" / name).string(), top, w, h, stride, err);
+            ok = ck2::writeExr((staging / "frames" / name).generic_u8string(), top, w, h, stride, err);
             setFileMode(staging / "frames" / name, root);
         }
         if (!ok) {
             setStatus("Error: " + err); return;
         }
         names.push_back(ck2::cacheFileName(f, settings));
-        ck2::writeThumb((cacheDir / (names.back() + ".thumb")).string(), ck2::makeThumb(top, w, h, stride));
+        ck2::writeThumb((cacheDir / (names.back() + ".thumb")).generic_u8string(), ck2::makeThumb(top, w, h, stride));
         setFileMode(cacheDir / (names.back() + ".thumb"), root);
 
         // Hint: one grey value per pixel, written as R=G=B.
@@ -561,7 +611,7 @@ void CorridorKey2Effect::startProcess() {
                     o[0] = o[1] = o[2] = v; o[3] = 1.0f;
                 }
             }
-            if (!ck2::writeExr((staging / "hint" / name).string(), hpx.data(), w, h, w * 4L, err)) {
+            if (!ck2::writeExr((staging / "hint" / name).generic_u8string(), hpx.data(), w, h, w * 4L, err)) {
                 setStatus("Error: " + err); return;
             }
             setFileMode(staging / "hint" / name, root);
@@ -573,10 +623,10 @@ void CorridorKey2Effect::startProcess() {
 
     ck2::JobSpec spec;
     spec.modelDir = model;
-    spec.framesDir = (staging / "frames").string();
-    spec.workDir = (staging / "work").string();
-    spec.outputDir = cacheDir.string();
-    spec.hintDir = (staging / "hint").string();
+    spec.framesDir = (staging / "frames").generic_u8string();
+    spec.workDir = (staging / "work").generic_u8string();
+    spec.outputDir = cacheDir.generic_u8string();
+    spec.hintDir = (staging / "hint").generic_u8string();
     spec.inputLinear = ck2::inputIsLinear(static_cast<ck2::InputSpace>(in));   // converted to linear Rec.709
     spec.window = kWindowChoices[win];
     spec.precision = kPrecisionChoices[prec];
@@ -587,7 +637,7 @@ void CorridorKey2Effect::startProcess() {
     spec.privateFiles = keepPrivate(root);
     fs::path jobPath = staging / "job.json";
     { std::ofstream(jobPath) << ck2::jobJson(spec); }
-    chmod(jobPath.c_str(), 0600);
+    setMode(jobPath, 0600);
 
     // Updates come from the worker's reader thread.
     // The Edit page (Filter context in Resolve) doesn't redraw by itself when the
@@ -604,8 +654,8 @@ void CorridorKey2Effect::startProcess() {
         }
     };
     std::string err;
-    auto job = ck2::Job::start(python, worker.string(), jobPath.string(),
-                               (localRoot() / "logs" / "worker.log").string(), onUpdate, err);
+    auto job = ck2::Job::start(python, worker.generic_u8string(), jobPath.generic_u8string(),
+                               (localRoot() / "logs" / "worker.log").generic_u8string(), onUpdate, err);
     if (!job) { setStatus("Error: " + err); return; }
     {
         std::lock_guard<std::mutex> lock(jobMutex_);
@@ -620,10 +670,22 @@ void CorridorKey2Effect::changedParam(const OFX::InstanceChangedArgs& args, cons
     if (name == kProcess) {
         startProcess();
     } else if (name == kInstallModel) {
+#ifdef _WIN32
+        const fs::path cmd = bundleResources() / "setup" / "ck2_setup.ps1";
+        if (!fs::exists(cmd)) { setStatus("Error: setup missing from the plugin"); return; }
+        wchar_t systemDir[32768];
+        const auto length = GetSystemDirectoryW(systemDir, 32768);
+        if (!length || length >= 32768) { setStatus("Error: Windows PowerShell was not found"); return; }
+        const auto exe = fs::path(systemDir) / "WindowsPowerShell/v1.0/powershell.exe";
+        const std::wstring args = L"-NoProfile -NoExit -ExecutionPolicy Bypass -File \"" + cmd.native() + L"\"";
+        const auto rc = reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", exe.c_str(), args.c_str(),
+                                                              cmd.parent_path().c_str(), SW_SHOWNORMAL));
+        setStatus(rc > 32 ? "Setup opened in PowerShell" : "Error: could not open PowerShell");
+#else
         // Opens the setup in Terminal, where it can ask for the licence and show progress.
         fs::path cmd = bundleResources() / "setup" / "Install CorridorKey Model.command";
         if (!fs::exists(cmd)) { setStatus("Error: setup missing from the plugin"); return; }
-        std::string open = "/usr/bin/open", a = "-a", term = "Terminal", c = cmd.string();
+        std::string open = "/usr/bin/open", a = "-a", term = "Terminal", c = cmd.generic_u8string();
         char* argv[] = {open.data(), a.data(), term.data(), c.data(), nullptr};
         pid_t pid;
         if (posix_spawn(&pid, open.c_str(), nullptr, nullptr, argv, environ) == 0) {
@@ -633,6 +695,7 @@ void CorridorKey2Effect::changedParam(const OFX::InstanceChangedArgs& args, cons
         } else {
             setStatus("Error: could not open Terminal");
         }
+#endif
     } else if (name == kClearCache) {
         {
             std::lock_guard<std::mutex> lock(jobMutex_);
@@ -665,7 +728,7 @@ void CorridorKey2Effect::changedParam(const OFX::InstanceChangedArgs& args, cons
         int removed = 0;
         for (const char* sub : {"mattes", "staging"}) {
             for (auto& e : fs::directory_iterator(root / sub, ec)) {
-                const std::string n = e.path().filename().string();
+                const std::string n = e.path().filename().generic_u8string();
                 if (n.size() == 16 && n.find_first_not_of("0123456789abcdef") == std::string::npos &&
                     e.is_directory(ec)) {
                     fs::remove_all(e.path(), ec);
@@ -673,7 +736,7 @@ void CorridorKey2Effect::changedParam(const OFX::InstanceChangedArgs& args, cons
                 }
             }
         }
-        plog("delete all cache: " + std::to_string(removed) + " nodes in " + root.string());
+        plog("delete all cache: " + std::to_string(removed) + " nodes in " + root.generic_u8string());
         setStatus("Deleted the cache of " + std::to_string(removed) + " node(s)");
         int tick = 0;
         refreshTick_->getValue(tick);
@@ -717,12 +780,12 @@ void CorridorKey2Effect::render(const OFX::RenderArguments& args) {
         fs::path file = dir / ck2::cacheFileName(std::lround(args.time), currentSettings(args.time));
         std::string err;
         const bool exists = fs::exists(file);
-        const bool read = exists && ck2::readExrRGBA(file.string(), cached, err);
+        const bool read = exists && ck2::readExrRGBA(file.generic_u8string(), cached, err);
         have = read && cached.width == sb.x2 - sb.x1 && cached.height == sb.y2 - sb.y1;
         // Same picture as at Process? (a slipped clip or a new grade upstream is not)
         std::vector<float> stored;
         double diff = 0.0;
-        if (have && ck2::readThumb(file.string() + ".thumb", stored)) {
+        if (have && ck2::readThumb(file.generic_u8string() + ".thumb", stored)) {
             const float* top = static_cast<const float*>(src->getPixelAddress(sb.x1, sb.y2 - 1));
             const long stride = -static_cast<long>(src->getRowBytes() / static_cast<int>(sizeof(float)));
             diff = ck2::thumbDiff(stored, ck2::makeThumb(top, sb.x2 - sb.x1, sb.y2 - sb.y1, stride));
@@ -803,7 +866,7 @@ void CorridorKey2Factory::describe(OFX::ImageEffectDescriptor& desc) {
     desc.setPluginGrouping("Creative Video Tips");
     desc.setPluginDescription(
         "CorridorKey 2 for Resolve (unofficial). Keys green and blue screens with "
-        "CorridorKey 2.0 by Corridor Digital, on Apple Silicon. By Creative Video Tips.");
+        "CorridorKey 2.0 by Corridor Digital. Resolve OFX by Creative Video Tips.");
     // Filter (Edit page) and General (Fusion page, with the Hint input). The
     // 0.06-0.12 Process freezes were setValue before fetchImage, not the
     // General context (0.11-0.13 offered Filter only while that was found).
@@ -1042,7 +1105,7 @@ void CorridorKey2Factory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     auto* model = desc.defineStringParam(kModelFolder);
     model->setAnimates(false);              // never keyframed
     model->setLabels("Model Folder", "Model Folder", "Model Folder");
-    model->setHint("Where CorridorKey 2.0 and its weights are on this Mac (Install Model puts "
+    model->setHint("Where CorridorKey 2.0 and its weights are on this computer (Install Model puts "
                    "them in ~/CorridorKey). For safety this is never taken from a comp; to use "
                    "another folder, set \"model_folder\" in ~/.config/cvt-corridorkey2/settings.json.");
     model->setStringType(OFX::eStringTypeDirectoryPath);
@@ -1055,7 +1118,7 @@ void CorridorKey2Factory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     auto* python = desc.defineStringParam(kPythonPath);
     python->setAnimates(false);              // never keyframed
     python->setLabels("Python", "Python", "Python");
-    python->setHint("The Python with CorridorKey's packages, on this Mac. For safety this is "
+    python->setHint("The Python with CorridorKey's packages on this computer. For safety this is "
                     "never taken from a comp; to use another, set \"python\" in "
                     "~/.config/cvt-corridorkey2/settings.json.");
     python->setStringType(OFX::eStringTypeFilePath);
@@ -1067,7 +1130,7 @@ void CorridorKey2Factory::describeInContext(OFX::ImageEffectDescriptor& desc, OF
     page->addChild(*python);
     auto* install = desc.definePushButtonParam(kInstallModel);
     install->setLabels("Install Model", "Install Model", "Install Model");
-    install->setHint("Opens Terminal to download and set up CorridorKey 2.0 and its weights "
+    install->setHint("Opens a setup window to download CorridorKey 2.0 and its weights "
                      "(about 5 GB) in ~/CorridorKey. Also repairs an existing install.");
     install->setParent(*gSetup);
     page->addChild(*install);

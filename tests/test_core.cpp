@@ -198,7 +198,8 @@ static void unitTests() {
     CHECK(ck2::jsonField(line, "event") == "progress");
     CHECK(ck2::jsonField(line, "done") == "12");
     CHECK(ck2::jsonField(line, "t") == "1.5");
-    CHECK(ck2::jsonField(R"({"message": "a \"b\"", "event": "error"})", "message") == "a \"b\"");
+    const std::string errorLine = R"({"message": "a \"b\"", "event": "error"})";
+    CHECK(ck2::jsonField(errorLine, "message") == "a \"b\"");
 
     // EXR round trip: DWAB 45 is lossy for colour (small error), exact for alpha.
     const int w = 96, h = 64;

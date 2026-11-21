@@ -207,6 +207,8 @@ def frame_size(path: str) -> tuple[int, int]:
 def make_plan(job: dict, frames: list[str]) -> dict:
     import torch
     width, height = frame_size(frames[0])
+    if sys.platform == "win32":
+        return cuda_plan(job, width, height, len(frames), torch)
     brand = mac_brand()
     gpu_gb = torch.mps.recommended_max_memory() / 2**30
     budget = min(gpu_gb, available_system_gb()) * MEM_USE_FRACTION
@@ -219,6 +221,7 @@ def make_plan(job: dict, frames: list[str]) -> dict:
     starts = chunk_starts(len(frames), window, max(1, window // 2))
     return {
         "mac": brand, "width": width, "height": height, "frames": len(frames),
+        "device": "mps", "low_vram": False,
         "window": window, "stride": max(1, window // 2), "precision": precision,
         "chunks": len(starts),
         "gpu_gb": round(gpu_gb, 1), "budget_gb": round(budget, 1),
@@ -226,11 +229,40 @@ def make_plan(job: dict, frames: list[str]) -> dict:
     }
 
 
+def cuda_plan(job: dict, width: int, height: int, count: int, torch) -> dict:
+    if not torch.cuda.is_available():
+        raise RuntimeError("The NVIDIA CUDA GPU is unavailable. Run Install Model to check the runtime.")
+    sys.path.insert(0, job["model_dir"])
+    import corridorkey.runtime as rt
+
+    free, total = torch.cuda.mem_get_info()
+    budget = free / 2**30 * MEM_USE_FRACTION
+    padded_w, padded_h = padded_size(width, height)
+    mpx = padded_w * padded_h / 1e6
+    if job["window"] == "auto":
+        window, _, low_vram, estimate = rt.select_vram_profile((padded_h, padded_w), count, budget)
+        window = min(window, count)
+    else:
+        window = max(1, min(int(job["window"]), count))
+        normal = rt.estimate_peak_vram_gb(mpx, window, False)
+        low_vram = normal * 1.1 + 0.3 > budget
+        estimate = rt.estimate_peak_vram_gb(mpx, window, low_vram)
+    stride = max(1, window // 2)
+    return {
+        "gpu": torch.cuda.get_device_name(0), "device": "cuda", "low_vram": low_vram,
+        "width": width, "height": height, "frames": count, "precision": "bf16",
+        "window": window, "stride": stride, "chunks": len(chunk_starts(count, window, stride)),
+        "gpu_gb": round(total / 2**30, 1), "budget_gb": round(budget, 1),
+        "estimate_gb": round(estimate * 1.1 + 0.3, 1),
+    }
+
+
 # --- the run (talks to CorridorKey) ----------------------------------------
 
 def run(job: dict, plan: dict, frames: list[str]) -> None:
-    import ck2_mps
-    ck2_mps.apply(plan["precision"])
+    if plan["device"] == "mps":
+        import ck2_mps
+        ck2_mps.apply(plan["precision"])
 
     model_dir = job["model_dir"]
     sys.path.insert(0, model_dir)
@@ -296,7 +328,7 @@ def run(job: dict, plan: dict, frames: list[str]) -> None:
     emit("status", message="loading model")
     t0 = time.time()
     paths = rt.RuntimePaths.from_package(model_dir)
-    model = rt.load_model(paths, device="mps")
+    model = rt.load_model(paths, device=plan["device"])
     emit("status", message="model loaded", seconds=round(time.time() - t0, 1))
 
     hint = job["hint"]
@@ -308,6 +340,7 @@ def run(job: dict, plan: dict, frames: list[str]) -> None:
 
     cfg = rt.InferenceConfig(
         hann_chunk=plan["window"], hann_stride=plan["stride"], auto_vram=False,
+        low_vram=plan["low_vram"],
         carry_hint=bool(hint["carry"]), hint_quality=float(hint["strength"]),
         carry_hint_quality=float(hint["strength"]),
         outputs={"alpha", "fg"}, temp_dir=work / "tmp",
@@ -325,12 +358,21 @@ def run(job: dict, plan: dict, frames: list[str]) -> None:
     if done["n"] != total or pending:
         raise RuntimeError(f"CorridorKey finished {done['n']} of {total} frames")
     shutil.rmtree(work, ignore_errors=True)
-    emit("cpu_fallbacks", **ck2_mps.CPU_FALLBACKS)
+    if plan["device"] == "mps":
+        emit("cpu_fallbacks", **ck2_mps.CPU_FALLBACKS)
 
 
 def check(model_dir: str) -> None:
-    """Loads CorridorKey on the Apple GPU once and reports what this Mac would use."""
+    """Loads the pinned model once and reports the GPU and an HD profile."""
     import torch
+    if sys.platform == "win32":
+        plan = cuda_plan({"model_dir": model_dir, "window": "auto"}, 1920, 1080, 80, torch)
+        import corridorkey.runtime as rt
+        t0 = time.time()
+        model = rt.load_model(rt.RuntimePaths.from_package(model_dir), device="cuda")
+        del model
+        emit("check", ok=True, hd_window=plan["window"], load_seconds=round(time.time() - t0, 1), **plan)
+        return
     import ck2_mps
     brand = mac_brand()
     precision = choose_precision(brand)

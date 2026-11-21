@@ -10,7 +10,9 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#ifndef _WIN32
 #include <sys/types.h>
+#endif
 
 namespace ck2 {
 
@@ -36,12 +38,18 @@ public:
     void detach();          // no more callbacks (the node is going away)
 
 private:
+    mutable std::mutex mutex_;
+#ifdef _WIN32
+    void readLoop(void* pipe);
+    void* process_ = nullptr;
+    void* processGroup_ = nullptr;
+#else
     void readLoop(int fd);
+    pid_t pid_ = -1;
+#endif
     void report(const JobUpdate& u);
 
-    mutable std::mutex mutex_;
     Callback callback_;
-    pid_t pid_ = -1;
     bool running_ = false;
     bool cancelled_ = false;
 };
